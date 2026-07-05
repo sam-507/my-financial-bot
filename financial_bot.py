@@ -6,9 +6,20 @@ from email.mime.multipart import MIMEMultipart
 # ==========================================
 # 1. YOUR CREDENTIALS (FILL THESE IN)
 # ==========================================
-sender_email = "shukmarsana@gmail.com"
-app_password = "rrjitaetzxaowpzc" 
-receiver_email = "shukumarsana@gmail.com"
+import os
+import smtplib
+import yfinance as ticker_tool
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# ==========================================
+# 1. PRODUCTION SECRETS (READS FROM GITHUB)
+# ==========================================
+sender_email = os.environ.get("SENDER_EMAIL")
+app_password = os.environ.get("APP_PASSWORD")
+receiver_email = os.environ.get("RECEIVER_EMAIL")
+
+# The rest of your code remains exactly the same...
 
 # The list of stocks you want your bot to screen daily
 watchlist = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX"]
