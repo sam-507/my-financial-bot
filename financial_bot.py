@@ -104,7 +104,9 @@ def send_daily_report(stocks_to_report):
     try:
         server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
         server.login(sender_email, app_password)
-        server.sendmail(sender_email, receiver_email, message.as_string())
+        # Splits the comma text into a clean list of individual emails
+        recipient_list = [email.strip() for email in receiver_email.split(",")]
+        server.sendmail(sender_email, recipient_list, message.as_string())
         server.quit()
         print("🎉 Dynamic daily report sent successfully!")
     except Exception as e:
