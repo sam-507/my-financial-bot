@@ -1,92 +1,40 @@
 import os
+import json
 import smtplib
 from datetime import datetime
-import pandas as pd
 import yfinance as ticker_tool
 from openai import OpenAI
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # ==========================================
-# 1. ENCRYPTED SYSTEM SECRETS
+# 1. CORE OPERATIONAL SECRETS
 # ==========================================
 sender_email = os.environ.get("SENDER_EMAIL")
 app_password = os.environ.get("APP_PASSWORD")
 receiver_email = os.environ.get("RECEIVER_EMAIL")
 openai_api_key = os.environ.get("OPENAI_API_KEY")
 
-# Initialize OpenAI Client safely
 ai_client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
-# Macro Sector-to-Theme Mapping Dictionary (Phase 2 Sector Mapping)
-SECTOR_MAP = {
-    "Automobile": "EV & Automotive Structural Tailwinds",
-    "Chemicals": "Specialty Chemicals Realignment",
-    "Construction": "Infrastructure & Capital Expenditure",
-    "Financial Services": "Financialization of Savings & Digital Lending",
-    "Information Technology": "Global Software Delivery & AI Engineering",
-    "Oil Gas & Consumable Fuels": "Energy Security & Transition",
-    "Capital Goods": "Industrial Manufacturing & EMS Renaissance",
-    "Healthcare": "Healthcare Delivery, Hospitals & Insurance Infrastructure",
-    "Power": "Data Center Energy Demand & Renewable Utilities"
-}
-
-def get_live_nifty_tickers():
+def load_quantitative_universe():
     try:
-        url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-        df = pd.read_csv(url)
-        # Keep both symbol and industry sector for structural analysis
-        return df[['Symbol', 'Industry']].to_dict('records')
+        with open("quant_universe.json", "r") as f:
+            return json.load(f)
     except Exception:
-        return [{"Symbol": "RELIANCE", "Industry": "Oil Gas & Consumable Fuels"}]
+        print("❌ Quantitative data missing. Run research_engine.py first.")
+        return []
 
 # ==========================================
-# 2. QUANTITATIVE WEIGHTED SCORING MATRIX
+# 2. DECISION MATRIX & CONFIRMATION ENGINE
 # ==========================================
-def calculate_investment_score(info, current_price, ma_50, ma_200):
-    score = 0
+def process_final_rankings():
+    print("⏳ Executing Layer 7-8: Final Decision & Confirmation Engine...")
+    quant_universe = load_quantitative_universe()
+    final_portfolio = []
     
-    # Category A: Growth & Quality (Max 40 Points)
-    rev_growth = info.get('revenueGrowth', 0) * 100
-    roe = info.get('returnOnEquity', 0) * 100
-    
-    if rev_growth >= 25: score += 20
-    elif rev_growth >= 15: score += 12
-    if roe >= 20: score += 20
-    elif roe >= 12: score += 10
-    
-    # Category B: Technical Momentum (Max 25 Points)
-    if current_price > ma_50: score += 10
-    if current_price > ma_200: score += 15
-    
-    # Category C: Valuation Guardrails (Max 20 Points)
-    peg = info.get('pegRatio', None)
-    pe = info.get('trailingPE', None)
-    
-    if peg and isinstance(peg, (int, float)) and peg < 1.2: score += 10
-    elif pe and isinstance(pe, (int, float)) and pe < 25: score += 8
-    score += 10 # Baseline score buffer for companies maintaining positive operating cash flow
-    
-    # Category D: Macro Sector Alignment (Max 15 Points)
-    industry = info.get('industry', '')
-    if any(sec in industry for sec in SECTOR_MAP.keys()):
-        score += 15
-
-    metrics_log = {"rev_growth": rev_growth, "roe": roe, "peg": peg if peg else "N/A", "pe": pe if pe else "N/A"}
-    return min(score, 100), metrics_log
-
-# ==========================================
-# 3. CORE ANALYTICAL FILTER & SORT PIPE
-# ==========================================
-def generate_analyst_universe():
-    raw_watchlist = get_live_nifty_tickers()
-    scored_universe = []
-    
-    # Core target pool allocation
-    target_pool = raw_watchlist[:80]
-    
-    for item in target_pool:
-        ticker = f"{item['Symbol']}.NS"
+    for company in quant_universe:
+        ticker = f"{company['ticker']}.NS"
         try:
             stock = ticker_tool.Ticker(ticker)
             history = stock.history(period="200d")
@@ -95,63 +43,75 @@ def generate_analyst_universe():
             current_price = history['Close'].iloc[-1]
             ma_50 = history['Close'].tail(50).mean()
             ma_200 = history['Close'].mean()
-            info = stock.info
             
-            score, metrics = calculate_investment_score(info, current_price, ma_50, ma_200)
+            # Layer 8: Market Confirmation Score (Max 20 Points)
+            # Check if the stock is supported by an active long-term uptrend structure
+            confirmation_score = 0
+            if current_price > ma_50: confirmation_score += 10
+            if current_price > ma_200: confirmation_score += 10
             
-            # Filter criteria: Only hand over institutional grade setups scoring above 65/100
-            if score >= 65:
-                scored_universe.append({
-                    "ticker": item['Symbol'],
-                    "industry": item['Industry'],
-                    "theme": SECTOR_MAP.get(item['Industry'], "General Economic Expansion"),
-                    "price": current_price,
-                    "score": score,
-                    **metrics
-                })
+            # Compile Final Combined Weighted Score
+            # Weight Distribution: Macro Tailwind (20%) + Company & Mispricing (40%) + Technical Confirmation (20%) + Baseline Catalyst Space (20%)
+            macro_weighted = (company['macro_score'] / 100) * 20
+            quant_weighted = (company['quant_score'] / 80) * 40
+            tech_weighted = confirmation_score
+            baseline_catalyst = 15 # Placeholder buffer for qualitative structural triggers
+            
+            final_score = int(macro_weighted + quant_weighted + tech_weighted + baseline_catalyst)
+            
+            final_portfolio.append({
+                "ticker": company['ticker'],
+                "industry": company['industry'],
+                "theme": company['theme'],
+                "price": current_price,
+                "rev_growth": company['rev_growth'],
+                "roe": company['roe'],
+                "pe": company['pe'],
+                "peg": company['peg'],
+                "score": min(final_score, 100)
+            })
         except Exception:
             continue
             
-    # Sort strictly by the highest multi-layer score
-    scored_universe.sort(key=lambda x: x['score'], reverse=True)
-    return scored_universe[:5] # Extract Top 5 thematic priorities for AI Analysis
+    # Sort strictly by the highest conviction score and extract the top 10 positions
+    final_portfolio.sort(key=lambda x: x['score'], reverse=True)
+    return final_portfolio[:10]
 
 # ==========================================
-# 4. QUALITATIVE GENERATIVE INSIGHTS LAYER
+# 3. GENERATIVE RESEARCH SYNTHESIS LAYER
 # ==========================================
-def enrich_report_with_ai(top_stocks):
-    if not ai_client or not top_stocks:
-        return "AI Analyst Module Offline: Missing API Credentials or Qualifying Matches."
+def generate_ai_analyst_notes(portfolio):
+    if not ai_client or not portfolio:
+        return "AI Inference Engine Offline: Missing configuration parameters."
     
     prompt = f"""
-    You are a Lead Institutional Investment Analyst specializing in the Indian Equities Market. 
-    Analyze the following structured dataset of top-scoring Nifty 500 growth candidates:
-
-    {top_stocks}
-
-    Provide an investment summary report for these specific companies. 
-    For each stock listed, generate a concise, bulleted 'Analyst Thesis' including:
-    1. The core structural driver explaining why its macro theme or sector is seeing capital allocation right now.
-    2. A brief analysis of its financial metrics (balancing high growth vs valuation constraints).
-    3. Potential core operational catalysts or risks to monitor over a 3-5 year horizon.
-
-    Keep your overall tone practical, realistic, professional, and dense with insight. Avoid generic fluff.
+    You are a Senior Buy-Side Equity Research Analyst evaluating allocations for a ₹1 Lakh long-term retail portfolio.
+    Analyze the following top-scoring Nifty 500 opportunities:
+    
+    {portfolio}
+    
+    Format a highly professional research report. For each of the listed companies, write a dense, scannable summary covering:
+    1. 'Investment Thesis': Why its macro theme or industry is experiencing sudden structural expansion.
+    2. 'Why Now & Catalysts': Identify high-probability corporate or regulatory catalysts (e.g., capacity expansion, government order pipelines, falling input costs, or an unappreciated growth-adjusted valuation).
+    3. 'Risks to Monitor': Core threats that could break the long-term 3-5 year thesis.
+    
+    Maintain a factual, objective tone. Do not use generic market filler text.
     """
     
     try:
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini", # Cost-efficient, high-speed model
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.2
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"Failed to synthesize qualitative layer due to API exception: {e}"
+        return f"AI generation layer error: {e}"
 
 # ==========================================
-# 5. ENTERPRISE REPORT DISPATCH ENGINE
+# 4. ENTERPRISE DELIVERY ENGINE
 # ==========================================
-def dispatch_investment_report(portfolio, ai_thesis, total_screened=80):
+def dispatch_newsletter(portfolio, ai_thesis):
     current_time = datetime.utcnow()
     date_str = current_time.strftime("%d %b %Y")
     
@@ -159,56 +119,59 @@ def dispatch_investment_report(portfolio, ai_thesis, total_screened=80):
     message = MIMEMultipart("alternative")
     message["From"] = sender_email
     message["To"] = ", ".join(recipient_list)
-    message["Subject"] = f"📈 Indian Market Discovery Report | {date_str}"
+    message["Subject"] = f"🎯 Daily Hypothesis Portfolio Alpha | {date_str}"
 
-    # Build Unified Text Output Channel
-    text_body = f"══════════════════════════════════════\n🎯 ALPHA ANALYST PORTFOLIO DEPLOYMENT\n══════════════════════════════════════\nDate: {date_str}\nScanned Universe: Top {total_screened} Elements from Nifty 500\n\n"
-    text_body += "📌 TOP RANKED INVESTMENT CANDIDATES (QUANT MASTER MATRIX)\n"
-    
+    # Text fall-back structure
+    text_body = f"══════════════════════════════════════\n🎯 HYPOTHESIS INVESTMENT RECOMMENDATION ENGINE\n══════════════════════════════════════\nDate: {date_str}\n\n"
     for idx, stock in enumerate(portfolio, start=1):
-        text_body += f"\n#{idx} 🔥 {stock['ticker']} [SCORE: {stock['score']}/100]\n"
+        text_body += f"#{idx} 🔥 {stock['ticker']} [CONVICTION: {stock['score']}/100]\n"
         text_body += f"   • Theme: {stock['theme']}\n"
-        text_body += f"   • Price: ₹{stock['price']:.2f} | YoY Revenue Growth: {stock['rev_growth']:.1f}% | ROE: {stock['roe']:.1f}%\n"
-    
-    text_body += f"\n\n══════════════════════════════════════\n🤖 INTELLECTUAL RESEARCH & ANALYST THESIS\n══════════════════════════════════════\n\n{ai_thesis}\n"
-    text_body += "\n\n══════════════════════════════\n⚠ Educational Research Disclaimer\nGenerated automatically via structural algorithms. Not direct financial advisory.\n══════════════════════════════"
+        text_body += f"   • Metrics: Price: ₹{stock['price']:.2f} | Growth: {stock['rev_growth']:.1f}% | ROE: {stock['roe']:.1f}% | PE: {stock['pe']}\n"
+    text_body += f"\n\nANALYST RESEARCH THESIS & RISKS:\n\n{ai_thesis}"
 
-    # Build Clean HTML Interface
+    # Professional HTML view
     html_body = f"""
     <!DOCTYPE html>
     <html>
     <body style="margin:0; padding:20px; font-family:'Segoe UI',Arial,sans-serif; background-color:#ffffff; color:#333333;">
         <div style="max-width:650px; margin:0 auto;">
-            <div style="border-bottom:3px solid #01579b; padding-bottom:15px; margin-bottom:25px;">
-                <h1 style="margin:0; color:#01579b; font-size:24px;">🎯 ALPHA ANALYST INSIGHTS REPORT</h1>
-                <p style="margin:5px 0 0 0; font-size:13px; color:#666666;">Macro Structural Research & Quantitative Allocation Engine • <strong>{date_str}</strong></p>
+            <div style="border-bottom:3px solid #006064; padding-bottom:15px; margin-bottom:25px;">
+                <h1 style="margin:0; color:#006064; font-size:22px;">🎯 HIGH-CONVICTION PROBABILISTIC PORTFOLIO</h1>
+                <p style="margin:5px 0 0 0; font-size:13px; color:#666666;">Optimal Risk-Reward Hypotheses for a 3-5 Year Horizon • <strong>{date_str}</strong></p>
             </div>
             
-            <h3 style="color:#01579b; text-transform:uppercase; font-size:14px; letter-spacing:0.5px;">📌 Top Ranked Investment Candidates</h3>
+            <div style="background-color:#fffde7; border:1px solid #fff59d; padding:12px; font-size:13px; color:#5d4037; border-radius:4px; margin-bottom:25px;">
+                <strong>💡 Allocation Strategy:</strong> This report outlines top ideas matching the structural macro model, sorted dynamically by our multi-layered hypothesis network.
+            </div>
     """
     
     for idx, stock in enumerate(portfolio, start=1):
         html_body += f"""
-        <div style="margin-bottom:15px; border:1px solid #e0e0e0; border-radius:6px; background-color:#fafafa; padding:15px;">
-            <table width="100%" style="border-collapse:collapse;">
-                <tr>
-                    <td><strong style="font-size:16px; color:#111;">#{idx} {stock['ticker']}</strong> <span style="font-size:12px; color:#666;">({stock['industry']})</span></td>
-                    <td align="right"><span style="background-color:#01579b; color:#fff; padding:3px 8px; border-radius:4px; font-size:12px; font-weight:bold;">SCORE: {stock['score']}/100</span></td>
-                </tr>
-            </table>
-            <p style="margin:8px 0 4px 0; font-size:13px; color:#0288d1;"><strong>Theme:</strong> {stock['theme']}</p>
-            <p style="margin:0; font-size:13px; color:#555;">Price: <strong>₹{stock['price']:.2f}</strong> | YoY Growth: <strong>{stock['rev_growth']:.1f}%</strong> | ROE: <strong>{stock['roe']:.1f}%</strong> | PEG: <strong>{stock['peg']}</strong></p>
+        <div style="margin-bottom:20px; border:1px solid #e0e0e0; border-radius:6px; background-color:#fafafa; overflow:hidden;">
+            <div style="background-color:#e0f7fa; padding:10px 15px; border-bottom:1px solid #e0e0e0;">
+                <table width="100%" style="border-collapse:collapse;">
+                    <tr>
+                        <td><strong style="font-size:15px; color:#006064;">#{idx} {stock['ticker']}</strong> <span style="font-size:11px; color:#555;">({stock['industry']})</span></td>
+                        <td align="right"><span style="background-color:#006064; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;">SCORE: {stock['score']}/100</span></td>
+                    </tr>
+                </table>
+            </div>
+            <div style="padding:12px 15px; font-size:13px; color:#444;">
+                <p style="margin:0 0 6px 0;"><strong>Macro Tailwind:</strong> {stock['theme']}</p>
+                <p style="margin:0;">Price: <strong>₹{stock['price']:.2f}</strong> | YoY Growth: <strong>{stock['rev_growth']:.1f}%</strong> | ROE: <strong>{stock['roe']:.1f}%</strong> | PE: <strong>{stock['pe']}</strong> | PEG: <strong>{stock['peg']}</strong></p>
+            </div>
         </div>
         """
         
     html_body += f"""
-            <div style="margin-top:30px; margin-bottom:30px; background-color:#f4fbfd; border-top:3px solid #0288d1; padding:20px; border-radius:0 0 4px 4px;">
-                <h3 style="margin-top:0; color:#01579b; font-size:15px;">🤖 Intellectual Research & Analyst Thesis</h3>
-                <div style="font-size:14px; line-height:1.6; color:#444; white-space: pre-line;">{ai_thesis}</div>
+            <div style="margin-top:30px; background-color:#fcfcfc; border-top:3px solid #006064; padding:20px; border-radius:4px; box-shadow:inset 0 1px 3px rgba(0,0,0,0.02);">
+                <h3 style="margin-top:0; color:#006064; font-size:15px; text-transform:uppercase;">📝 Deep Equity Research & Analyst Notes</h3>
+                <div style="font-size:13.5px; line-height:1.6; color:#444; white-space: pre-line;">{ai_thesis}</div>
             </div>
             
-            <div style="border-top:1px solid #e0e0e0; padding-top:15px; text-align:center; font-size:11px; color:#888;">
-                <p><strong>⚠ Regulatory & Compliance Disclaimer</strong><br>This system is an automated structural experiment parsing public metadata for educational exploration. It does not constitute formal advisory portfolio actions.</p>
+            <div style="margin-top:40px; border-top:1px solid #e0e0e0; padding-top:15px; text-align:center; font-size:10.5px; color:#888; line-height:1.5;">
+                <p><strong>⚠ Regulatory & Compliance Disclaimer</strong><br>
+                This automated system calculates directional investment probabilities for educational purposes. It does not provide definitive asset price predictions or individualized investment management advice. Past structural performance metrics do not guarantee forward-looking realization.</p>
             </div>
         </div>
     </body>
@@ -223,14 +186,14 @@ def dispatch_investment_report(portfolio, ai_thesis, total_screened=80):
         server.login(sender_email, app_password)
         server.sendmail(sender_email, recipient_list, message.as_string())
         server.quit()
-        print("🎉 High-conviction analyst report successfully compiled and dispatched.")
+        print("🎉 Modular Multi-Engine report safely delivered to all endpoints.")
     except Exception as e:
-        print(f"SMTP operational failure: {e}")
+        print(f"SMTP delivery error: {e}")
 
 # ==========================================
-# EXECUTIVE EXECUTION TRACE
+# SYSTEM ORCHESTRATION MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    high_conviction_universe = generate_analyst_universe()
-    thesis_payload = enrich_report_with_ai(high_conviction_universe)
-    dispatch_investment_report(high_conviction_universe, thesis_payload)
+    validated_portfolio = process_final_rankings()
+    analyst_thesis = generate_ai_analyst_notes(validated_portfolio)
+    dispatch_newsletter(validated_portfolio, analyst_thesis)
