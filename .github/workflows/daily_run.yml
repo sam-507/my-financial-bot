@@ -23,10 +23,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance pandas openai
 
-      - name: Execute Screener Engine
+      - name: Execute Assembly Pipeline
         env:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: python financial_bot.py
+        run: |
+          python macro_engine.py
+          python research_engine.py
+          python financial_bot.py
