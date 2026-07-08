@@ -3,248 +3,218 @@ import smtplib
 from datetime import datetime
 import pandas as pd
 import yfinance as ticker_tool
+from openai import OpenAI
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # ==========================================
-# 1. PRODUCTION SECRETS (READS FROM GITHUB)
+# 1. ENCRYPTED SYSTEM SECRETS
 # ==========================================
 sender_email = os.environ.get("SENDER_EMAIL")
 app_password = os.environ.get("APP_PASSWORD")
 receiver_email = os.environ.get("RECEIVER_EMAIL")
+openai_api_key = os.environ.get("OPENAI_API_KEY")
 
-# ==========================================
-# 2. DYNAMIC LIVE TICKER GENERATOR (INDIA)
-# ==========================================
+# Initialize OpenAI Client safely
+ai_client = OpenAI(api_key=openai_api_key) if openai_api_key else None
+
+# Macro Sector-to-Theme Mapping Dictionary (Phase 2 Sector Mapping)
+SECTOR_MAP = {
+    "Automobile": "EV & Automotive Structural Tailwinds",
+    "Chemicals": "Specialty Chemicals Realignment",
+    "Construction": "Infrastructure & Capital Expenditure",
+    "Financial Services": "Financialization of Savings & Digital Lending",
+    "Information Technology": "Global Software Delivery & AI Engineering",
+    "Oil Gas & Consumable Fuels": "Energy Security & Transition",
+    "Capital Goods": "Industrial Manufacturing & EMS Renaissance",
+    "Healthcare": "Healthcare Delivery, Hospitals & Insurance Infrastructure",
+    "Power": "Data Center Energy Demand & Renewable Utilities"
+}
+
 def get_live_nifty_tickers():
-    print("Downloading live Nifty 500 list from NiftyIndices...")
     try:
         url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
         df = pd.read_csv(url)
-        tickers = [f"{symbol}.NS" for symbol in df['Symbol'].tolist()]
-        print(f"Successfully loaded {len(tickers)} Indian stocks for screening.")
-        return tickers
-    except Exception as e:
-        print(f"Failed to fetch live list: {e}. Falling back to emergency top stocks.")
-        return ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "TATAMOTORS.NS"]
+        # Keep both symbol and industry sector for structural analysis
+        return df[['Symbol', 'Industry']].to_dict('records')
+    except Exception:
+        return [{"Symbol": "RELIANCE", "Industry": "Oil Gas & Consumable Fuels"}]
 
 # ==========================================
-# 3. THE SCREENING BRAIN
+# 2. QUANTITATIVE WEIGHTED SCORING MATRIX
 # ==========================================
-def screen_stocks():
-    watchlist = get_live_nifty_tickers()
-    passing_stocks = []
-    stocks_screened_count = 0
-
-    # Screening target limit remains exactly 80
-    target_pool = watchlist[:80]
+def calculate_investment_score(info, current_price, ma_50, ma_200):
+    score = 0
     
-    for ticker in target_pool:
+    # Category A: Growth & Quality (Max 40 Points)
+    rev_growth = info.get('revenueGrowth', 0) * 100
+    roe = info.get('returnOnEquity', 0) * 100
+    
+    if rev_growth >= 25: score += 20
+    elif rev_growth >= 15: score += 12
+    if roe >= 20: score += 20
+    elif roe >= 12: score += 10
+    
+    # Category B: Technical Momentum (Max 25 Points)
+    if current_price > ma_50: score += 10
+    if current_price > ma_200: score += 15
+    
+    # Category C: Valuation Guardrails (Max 20 Points)
+    peg = info.get('pegRatio', None)
+    pe = info.get('trailingPE', None)
+    
+    if peg and isinstance(peg, (int, float)) and peg < 1.2: score += 10
+    elif pe and isinstance(pe, (int, float)) and pe < 25: score += 8
+    score += 10 # Baseline score buffer for companies maintaining positive operating cash flow
+    
+    # Category D: Macro Sector Alignment (Max 15 Points)
+    industry = info.get('industry', '')
+    if any(sec in industry for sec in SECTOR_MAP.keys()):
+        score += 15
+
+    metrics_log = {"rev_growth": rev_growth, "roe": roe, "peg": peg if peg else "N/A", "pe": pe if pe else "N/A"}
+    return min(score, 100), metrics_log
+
+# ==========================================
+# 3. CORE ANALYTICAL FILTER & SORT PIPE
+# ==========================================
+def generate_analyst_universe():
+    raw_watchlist = get_live_nifty_tickers()
+    scored_universe = []
+    
+    # Core target pool allocation
+    target_pool = raw_watchlist[:80]
+    
+    for item in target_pool:
+        ticker = f"{item['Symbol']}.NS"
         try:
             stock = ticker_tool.Ticker(ticker)
             history = stock.history(period="200d")
-            if history.empty or len(history) < 200:
-                continue
-                
-            stocks_screened_count += 1
+            if history.empty or len(history) < 200: continue
+            
             current_price = history['Close'].iloc[-1]
             ma_50 = history['Close'].tail(50).mean()
             ma_200 = history['Close'].mean()
-            
             info = stock.info
-            rev_growth = info.get('revenueGrowth', 0) * 100
-            roe = info.get('returnOnEquity', 0) * 100
-            peg = info.get('pegRatio', 'N/A')
-
-            # Core business criteria remains unchanged
-            is_trending = current_price > ma_50 and current_price > ma_200
-            has_strong_growth = rev_growth >= 15.0
             
-            if is_trending and has_strong_growth:
-                passing_stocks.append({
-                    "ticker": ticker.replace(".NS", ""),
+            score, metrics = calculate_investment_score(info, current_price, ma_50, ma_200)
+            
+            # Filter criteria: Only hand over institutional grade setups scoring above 65/100
+            if score >= 65:
+                scored_universe.append({
+                    "ticker": item['Symbol'],
+                    "industry": item['Industry'],
+                    "theme": SECTOR_MAP.get(item['Industry'], "General Economic Expansion"),
                     "price": current_price,
-                    "rev_growth": rev_growth,
-                    "roe": roe,
-                    "peg": peg
+                    "score": score,
+                    **metrics
                 })
         except Exception:
             continue
             
-    return passing_stocks, stocks_screened_count
+    # Sort strictly by the highest multi-layer score
+    scored_universe.sort(key=lambda x: x['score'], reverse=True)
+    return scored_universe[:5] # Extract Top 5 thematic priorities for AI Analysis
 
 # ==========================================
-# 4. FORMAT AND EMAIL GENERATION
+# 4. QUALITATIVE GENERATIVE INSIGHTS LAYER
 # ==========================================
-def send_daily_report(stocks_to_report, total_screened):
-    # Dynamic Date Handling
+def enrich_report_with_ai(top_stocks):
+    if not ai_client or not top_stocks:
+        return "AI Analyst Module Offline: Missing API Credentials or Qualifying Matches."
+    
+    prompt = f"""
+    You are a Lead Institutional Investment Analyst specializing in the Indian Equities Market. 
+    Analyze the following structured dataset of top-scoring Nifty 500 growth candidates:
+
+    {top_stocks}
+
+    Provide an investment summary report for these specific companies. 
+    For each stock listed, generate a concise, bulleted 'Analyst Thesis' including:
+    1. The core structural driver explaining why its macro theme or sector is seeing capital allocation right now.
+    2. A brief analysis of its financial metrics (balancing high growth vs valuation constraints).
+    3. Potential core operational catalysts or risks to monitor over a 3-5 year horizon.
+
+    Keep your overall tone practical, realistic, professional, and dense with insight. Avoid generic fluff.
+    """
+    
+    try:
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini", # Cost-efficient, high-speed model
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Failed to synthesize qualitative layer due to API exception: {e}"
+
+# ==========================================
+# 5. ENTERPRISE REPORT DISPATCH ENGINE
+# ==========================================
+def dispatch_investment_report(portfolio, ai_thesis, total_screened=80):
     current_time = datetime.utcnow()
     date_str = current_time.strftime("%d %b %Y")
-    time_str = current_time.strftime("%H:%M UTC")
-
-    # Success rate metrics calculations
-    matches_found = len(stocks_to_report)
-    success_rate = (matches_found / total_screened * 100) if total_screened > 0 else 0
-
-    # Multi-recipient parsing logic preserved
+    
     recipient_list = [email.strip() for email in receiver_email.split(",")]
-
-    # Initialize container for matching HTML & Plain Text distribution
     message = MIMEMultipart("alternative")
     message["From"] = sender_email
     message["To"] = ", ".join(recipient_list)
     message["Subject"] = f"📈 Indian Market Discovery Report | {date_str}"
 
-    # -------------------------------------------------------------------------
-    # FORMAT A: PLAIN TEXT VERSION
-    # -------------------------------------------------------------------------
-    text_body = "══════════════════════════════════════\n"
-    text_body += "📈 INDIAN MARKET DISCOVERY REPORT\n"
-    text_body += "══════════════════════════════════════\n\n"
-    text_body += f"📅 Report Date:\n{date_str}\n\n"
-    text_body += f"🕘 Generated At:\n{time_str}\n\n"
-    text_body += "📊 Universe Scanned:\nTop 80 stocks from Nifty 500\n\n"
-    text_body += "✅ Screening Criteria\n• Price > 50 DMA\n• Price > 200 DMA\n• Revenue Growth ≥ 15%\n\n"
-    text_body += "-----------------------------------------\n\n"
-    text_body += "📌 MARKET SUMMARY\n\n"
-    text_body += f"Stocks Screened: {total_screened}\n"
-    text_body += f"Matches Found: {matches_found}\n"
-    text_body += f"Success Rate: {success_rate:.1f}%\n\n"
-    text_body += "-----------------------------------------\n\n"
+    # Build Unified Text Output Channel
+    text_body = f"══════════════════════════════════════\n🎯 ALPHA ANALYST PORTFOLIO DEPLOYMENT\n══════════════════════════════════════\nDate: {date_str}\nScanned Universe: Top {total_screened} Elements from Nifty 500\n\n"
+    text_body += "📌 TOP RANKED INVESTMENT CANDIDATES (QUANT MASTER MATRIX)\n"
+    
+    for idx, stock in enumerate(portfolio, start=1):
+        text_body += f"\n#{idx} 🔥 {stock['ticker']} [SCORE: {stock['score']}/100]\n"
+        text_body += f"   • Theme: {stock['theme']}\n"
+        text_body += f"   • Price: ₹{stock['price']:.2f} | YoY Revenue Growth: {stock['rev_growth']:.1f}% | ROE: {stock['roe']:.1f}%\n"
+    
+    text_body += f"\n\n══════════════════════════════════════\n🤖 INTELLECTUAL RESEARCH & ANALYST THESIS\n══════════════════════════════════════\n\n{ai_thesis}\n"
+    text_body += "\n\n══════════════════════════════\n⚠ Educational Research Disclaimer\nGenerated automatically via structural algorithms. Not direct financial advisory.\n══════════════════════════════"
 
-    if not stocks_to_report:
-        text_body += "No major companies cleared the strict momentum and high-growth standard filters today.\n"
-    else:
-        for idx, item in enumerate(stocks_to_report, start=1):
-            peg_val = f"{item['peg']:.2f}" if isinstance(item['peg'], (int, float)) else str(item['peg'])
-            text_body += "━━━━━━━━━━━━━━━━━━━━━━\n"
-            text_body += f"#{idx} 🔥 {item['ticker']}\n\n"
-            text_body += f"💰 Price: ₹{item['price']:.2f}\n"
-            text_body += f"📈 Revenue Growth: {item['rev_growth']:.1f}%\n"
-            text_body += f"🏆 ROE: {item['roe']:.1f}%\n"
-            text_body += f"📊 PEG: {peg_val}\n"
-            text_body += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    text_body += "══════════════════════════════\n\n"
-    text_body += "⚠ Disclaimer\n\n"
-    text_body += "This report is automatically generated using publicly available market data.\n\n"
-    text_body += "It is intended for educational and research purposes only and should not be considered investment advice.\n\n"
-    text_body += "Always perform your own due diligence before investing.\n\n"
-    text_body += "══════════════════════════════"
-
-    # -------------------------------------------------------------------------
-    # FORMAT B: HTML VERSION
-    # -------------------------------------------------------------------------
+    # Build Clean HTML Interface
     html_body = f"""
     <!DOCTYPE html>
     <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Indian Market Discovery Report</title>
-    </head>
-    <body style="margin: 0; padding: 20px; background-color: #ffffff; font-family: 'Segoe UI', Arial, sans-serif; color: #333333; -webkit-font-smoothing: antialiased;">
-        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff;">
-            
-            <div style="border: 2px double #0288d1; padding: 20px; text-align: center; background-color: #f4fbfd; margin-bottom: 25px;">
-                <h1 style="margin: 0; font-size: 22px; color: #0288d1; letter-spacing: 1px; font-weight: 700;">📈 INDIAN MARKET DISCOVERY REPORT</h1>
+    <body style="margin:0; padding:20px; font-family:'Segoe UI',Arial,sans-serif; background-color:#ffffff; color:#333333;">
+        <div style="max-width:650px; margin:0 auto;">
+            <div style="border-bottom:3px solid #01579b; padding-bottom:15px; margin-bottom:25px;">
+                <h1 style="margin:0; color:#01579b; font-size:24px;">🎯 ALPHA ANALYST INSIGHTS REPORT</h1>
+                <p style="margin:5px 0 0 0; font-size:13px; color:#666666;">Macro Structural Research & Quantitative Allocation Engine • <strong>{date_str}</strong></p>
             </div>
             
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-bottom: 25px; border-collapse: collapse;">
+            <h3 style="color:#01579b; text-transform:uppercase; font-size:14px; letter-spacing:0.5px;">📌 Top Ranked Investment Candidates</h3>
+    """
+    
+    for idx, stock in enumerate(portfolio, start=1):
+        html_body += f"""
+        <div style="margin-bottom:15px; border:1px solid #e0e0e0; border-radius:6px; background-color:#fafafa; padding:15px;">
+            <table width="100%" style="border-collapse:collapse;">
                 <tr>
-                    <td width="50%" style="vertical-align: top; padding-right: 10px;">
-                        <p style="margin: 0 0 5px 0; font-size: 12px; text-transform: uppercase; color: #777777; font-weight: bold; letter-spacing: 0.5px;">📅 Report Date</p>
-                        <p style="margin: 0 0 15px 0; font-size: 15px; font-weight: 600; color: #111111;">{date_str}</p>
-                        
-                        <p style="margin: 0 0 5px 0; font-size: 12px; text-transform: uppercase; color: #777777; font-weight: bold; letter-spacing: 0.5px;">🕘 Generated At</p>
-                        <p style="margin: 0 0 15px 0; font-size: 15px; font-weight: 600; color: #111111;">{time_str}</p>
-                    </td>
-                    <td width="50%" style="vertical-align: top; padding-left: 10px; border-left: 1px solid #e0e0e0;">
-                        <p style="margin: 0 0 5px 0; font-size: 12px; text-transform: uppercase; color: #777777; font-weight: bold; letter-spacing: 0.5px;">📊 Universe Scanned</p>
-                        <p style="margin: 0 0 15px 0; font-size: 14px; font-weight: 600; color: #111111;">Top 80 stocks from Nifty 500</p>
-                        
-                        <p style="margin: 0 0 5px 0; font-size: 12px; text-transform: uppercase; color: #777777; font-weight: bold; letter-spacing: 0.5px;">✅ Screening Criteria</p>
-                        <ul style="margin: 0; padding: 0 0 0 15px; font-size: 13px; color: #444444; line-height: 1.4;">
-                            <li style="margin-bottom: 2px;">Price &gt; 50 DMA</li>
-                            <li style="margin-bottom: 2px;">Price &gt; 200 DMA</li>
-                            <li style="margin-bottom: 0;">Revenue Growth &ge; 15%</li>
-                        </ul>
-                    </td>
+                    <td><strong style="font-size:16px; color:#111;">#{idx} {stock['ticker']}</strong> <span style="font-size:12px; color:#666;">({stock['industry']})</span></td>
+                    <td align="right"><span style="background-color:#01579b; color:#fff; padding:3px 8px; border-radius:4px; font-size:12px; font-weight:bold;">SCORE: {stock['score']}/100</span></td>
                 </tr>
             </table>
-
-            <div style="background-color: #f8f9fa; border-left: 4px solid #0288d1; padding: 15px; margin-bottom: 30px; border-radius: 4px;">
-                <h3 style="margin: 0 0 10px 0; font-size: 14px; text-transform: uppercase; color: #0288d1; font-weight: bold; letter-spacing: 0.5px;">📌 MARKET SUMMARY</h3>
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size: 14px; color: #444444;">
-                    <tr>
-                        <td style="padding: 3px 0;">Stocks Screened:</td>
-                        <td align="right" style="font-weight: bold; color: #111111;">{total_screened}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 3px 0;">Matches Found:</td>
-                        <td align="right" style="font-weight: bold; color: #111111;">{matches_found}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 3px 0;">Success Rate:</td>
-                        <td align="right" style="font-weight: bold; color: #0288d1;">{success_rate:.1f}%</td>
-                    </tr>
-                </table>
-            </div>
-
-            """
-
-    if not stocks_to_report:
-        html_body += """
-            <div style="text-align: center; padding: 30px; border: 1px dashed #cccccc; color: #666666; font-size: 14px; border-radius: 4px;">
-                No major companies cleared the strict momentum and high-growth standard filters today.
-            </div>
+            <p style="margin:8px 0 4px 0; font-size:13px; color:#0288d1;"><strong>Theme:</strong> {stock['theme']}</p>
+            <p style="margin:0; font-size:13px; color:#555;">Price: <strong>₹{stock['price']:.2f}</strong> | YoY Growth: <strong>{stock['rev_growth']:.1f}%</strong> | ROE: <strong>{stock['roe']:.1f}%</strong> | PEG: <strong>{stock['peg']}</strong></p>
+        </div>
         """
-    else:
-        for idx, item in enumerate(stocks_to_report, start=1):
-            peg_val = f"{item['peg']:.2f}" if isinstance(item['peg'], (int, float)) else str(item['peg'])
-            html_body += f"""
-            <div style="margin-bottom: 20px; background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.02);">
-                <div style="background-color: #f4fbfd; padding: 12px 15px; border-bottom: 1px solid #e0e0e0;">
-                    <h4 style="margin: 0; font-size: 15px; color: #111111; font-weight: bold;">#{idx} 🔥 {item['ticker']}</h4>
-                </div>
-                <div style="padding: 15px;">
-                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size: 14px; color: #555555;">
-                        <tr>
-                            <td style="padding: 4px 0;">💰 Price:</td>
-                            <td align="right" style="font-weight: 600; color: #111111;">₹{item['price']:.2f}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 4px 0;">📈 Revenue Growth:</td>
-                            <td align="right" style="font-weight: 600; color: #2e7d32;">{item['rev_growth']:.1f}%</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 4px 0;">🏆 ROE:</td>
-                            <td align="right" style="font-weight: 600; color: #111111;">{item['roe']:.1f}%</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 4px 0;">📊 PEG:</td>
-                            <td align="right" style="font-weight: 600; color: #111111;">{peg_val}</td>
-                        </tr>
-                    </table>
-                </div>
-            </div>
-            """
-
-    # Structured Professional Footer Block
-    html_body += """
-            <div style="margin-top: 35px; border-top: 1px solid #e0e0e0; padding-top: 20px; text-align: center; font-size: 11px; color: #777777; line-height: 1.6;">
-                <p style="margin: 0 0 8px 0; font-size: 12px; font-weight: bold; color: #555555; text-transform: uppercase; letter-spacing: 0.5px;">⚠ Disclaimer</p>
-                <p style="margin: 0 0 8px 0;">This report is automatically generated using publicly available market data.</p>
-                <p style="margin: 0 0 8px 0;">It is intended for educational and research purposes only and should not be considered investment advice.</p>
-                <p style="margin: 0;">Always perform your own due diligence before investing.</p>
+        
+    html_body += f"""
+            <div style="margin-top:30px; margin-bottom:30px; background-color:#f4fbfd; border-top:3px solid #0288d1; padding:20px; border-radius:0 0 4px 4px;">
+                <h3 style="margin-top:0; color:#01579b; font-size:15px;">🤖 Intellectual Research & Analyst Thesis</h3>
+                <div style="font-size:14px; line-height:1.6; color:#444; white-space: pre-line;">{ai_thesis}</div>
             </div>
             
+            <div style="border-top:1px solid #e0e0e0; padding-top:15px; text-align:center; font-size:11px; color:#888;">
+                <p><strong>⚠ Regulatory & Compliance Disclaimer</strong><br>This system is an automated structural experiment parsing public metadata for educational exploration. It does not constitute formal advisory portfolio actions.</p>
+            </div>
         </div>
     </body>
     </html>
     """
 
-    # Attach alternate plain and layout views
     message.attach(MIMEText(text_body, "plain"))
     message.attach(MIMEText(html_body, "html"))
 
@@ -253,13 +223,14 @@ def send_daily_report(stocks_to_report, total_screened):
         server.login(sender_email, app_password)
         server.sendmail(sender_email, recipient_list, message.as_string())
         server.quit()
-        print("🎉 Clean UX daily report sent successfully to all recipients!")
+        print("🎉 High-conviction analyst report successfully compiled and dispatched.")
     except Exception as e:
-        print(f"Email dispatch error: {e}")
+        print(f"SMTP operational failure: {e}")
 
 # ==========================================
-# RUN THE ENGINE
+# EXECUTIVE EXECUTION TRACE
 # ==========================================
 if __name__ == "__main__":
-    passed_list, screened_count = screen_stocks()
-    send_daily_report(passed_list, screened_count)
+    high_conviction_universe = generate_analyst_universe()
+    thesis_payload = enrich_report_with_ai(high_conviction_universe)
+    dispatch_investment_report(high_conviction_universe, thesis_payload)
